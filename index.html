@@ -3456,7 +3456,7 @@ let editsPending = false;  // unsaved changes indicator
    Dashboard → Settings → API
 ══════════════════════════════════════════════════════ */
 const SB_URL     = 'https://ppytmzkxstglrbyirqal.supabase.co';
-const SB_ANON    = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBweXRtemt4c3RnbHJieWlycWFsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzMDc4MDIsImV4cCI6MjA5NTg4MzgwMn0.pZOFVoo_CZ2N4zntop9cn8ivUSR53h4ZdJVktek8hdM'; // paste your anon/public key here
+const SB_ANON    = 'YOUR_SUPABASE_ANON_KEY'; // paste your anon/public key here
 
 function sbHeaders(extra={}){
   return {
@@ -3535,7 +3535,7 @@ function loadLocalEdits(){
   } catch(ex){ console.warn('Could not load local edits', ex); }
 }
 
-async function persistEdit(vessel, principal, field, newVal){
+async function persistEdit(vessel, principal, field, oldVal, newVal){
   const pic = document.getElementById('me-sel')?.value || 'Unknown';
 
   // camelCase JS field → snake_case DB column map
@@ -3552,25 +3552,23 @@ async function persistEdit(vessel, principal, field, newVal){
   const dbCol = colMap[field] || field;
 
   try{
-    // 1) Update the vessel row
-    const patchRes = await fetch(
-      `${SB_URL}/rest/v1/vessels?vessel=eq.${encodeURIComponent(vessel)}&principal=eq.${encodeURIComponent(principal)}`,
-      {
-        method: 'PATCH',
-        headers: sbHeaders({ 'Prefer': 'return=minimal' }),
-        body: JSON.stringify({ [dbCol]: newVal })
-      }
-    );
-    if(!patchRes.ok){
-      const err = await patchRes.json().catch(()=>({}));
-      throw new Error(err.message || patchRes.status);
+    // 1) Upsert the vessel row — works whether the row exists or not.
+    //    Supabase PATCH returns 405 when no row matches; upsert (POST + merge) is always safe.
+    const upsertRes = await fetch(`${SB_URL}/rest/v1/vessels`, {
+      method: 'POST',
+      headers: sbHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify({ vessel, principal, [dbCol]: newVal })
+    });
+    if(!upsertRes.ok){
+      const err = await upsertRes.json().catch(()=>({}));
+      throw new Error(err.message || err.hint || upsertRes.status);
     }
 
     // 2) Append audit log row
     await fetch(`${SB_URL}/rest/v1/audit_log`, {
       method: 'POST',
       headers: sbHeaders({ 'Prefer': 'return=minimal' }),
-      body: JSON.stringify({ vessel, principal, field: dbCol, new_val: newVal, by: pic })
+      body: JSON.stringify({ vessel, principal, field: dbCol, old_val: oldVal ?? null, new_val: newVal, by: pic })
     });
 
     // Success — remove from local fallback if it was saved there
@@ -3789,7 +3787,7 @@ async function applyEdit(vessel, principal, field, oldVal, newVal){
   // issueType is sent as-is; Netlify function maps camelCase → snake_case
   const dbField = field === 'notes' ? 'note' : field;
   try{
-    await persistEdit(vessel, principal, dbField, newVal);
+    await persistEdit(vessel, principal, dbField, oldVal, newVal);
     showToast(`✓ ${vessel} · ${fieldLabel} saved`, 'ok');
     refreshAuditDrawer();
   }catch(e){
@@ -3849,8 +3847,8 @@ async function refreshAuditDrawer(){
         <div class="audit-entry-vessel">${e.vessel} <span style="color:var(--text3);font-weight:400;font-size:10px;">(${e.principal||'—'})</span></div>
         <div class="audit-entry-change">
           <span class="audit-entry-field">${fieldLabel[e.field]||e.field}</span>: 
-          <span style="color:var(--red);text-decoration:line-through;">${e.oldVal||'—'}</span>
-          → <span style="color:var(--green);font-weight:600;">${e.newVal||'—'}</span>
+          <span style="color:var(--red);text-decoration:line-through;">${e.old_val||'—'}</span>
+          → <span style="color:var(--green);font-weight:600;">${e.new_val||'—'}</span>
         </div>
         <div class="audit-entry-by">By: ${e.by} · ${timeStr}</div>
       </div>`;
@@ -3906,7 +3904,7 @@ async function exportXLSX(){
       if(log.length){
         const auditData = log.map(e=>({
           'Vessel':e.vessel,'Principal':e.principal,
-          'Field Changed':e.field,'Old Value':e.oldVal||'','New Value':e.newVal||'',
+          'Field Changed':e.field,'Old Value':e.old_val||'','New Value':e.new_val||'',
           'Updated By':e.by,'Timestamp':new Date(e.ts).toLocaleString('en-GB')
         }));
         const ws2 = XLSX.utils.json_to_sheet(auditData);
