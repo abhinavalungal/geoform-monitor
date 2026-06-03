@@ -1961,22 +1961,22 @@ function ingestXLSX(file){
       // ── Sync to database ──
       showToast('⏳ Syncing to database…', 'ok');
       try{
-        const res = await fetch('/.netlify/functions/sync', {
+        const res = await fetch(`${SB_URL}/rest/v1/vessels`, {
           method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ vessels: RAW.map(r=>({
-            principal:      r.principal      || null,
-            vessel:         r.vessel         || null,
-            pic:            r.pic            || null,
-            lastApproved:   r.lastApproved   || null,
-            issue:          r.issue          || null,
-            issueType:      r.issueType      || null,
-            biofuel:        r.biofuel        || null,
-            biofuelOnboard: r.biofuelOnboard || null,
-            issueMonth:     r.issueMonth     || null,
-            resolvedMonth:  r.resolvedMonth  || null,
-            yearEnd:        r.yearEnd        || null,
-          }))})
+          headers: sbHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify( RAW.map(r=>({
+            principal:       r.principal      || null,
+            vessel:          r.vessel         || null,
+            pic:             r.pic            || null,
+            last_approved:   r.lastApproved   || null,
+            issue:           r.issue          || null,
+            issue_type:      r.issueType      || null,
+            biofuel:         r.biofuel        || null,
+            biofuel_onboard: r.biofuelOnboard || null,
+            issue_month:     r.issueMonth     || null,
+            resolved_month:  r.resolvedMonth  || null,
+            year_end:        r.yearEnd        || null,
+          })) )
         });
         const data = await res.json();
         if(res.ok){
@@ -2845,7 +2845,9 @@ function destroyIssueChart(k){ if(issueCharts[k]){ issueCharts[k].destroy(); del
 
 async function loadIssueTrends(){
   try{
-    const res = await fetch('/.netlify/functions/trends');
+    const res = await fetch(`${SB_URL}/rest/v1/audit_log?select=vessel,principal,field,ts&order=ts.desc&limit=1000`, {
+      headers: sbHeaders()
+    });
     if(!res.ok) throw new Error(res.status);
     const data = await res.json();
     renderIssueTrends(data);
@@ -3449,10 +3451,28 @@ let editMode    = false;   // whether edit mode is active
 let editsPending = false;  // unsaved changes indicator
 
 /* ── Load & merge persisted edits from DB into RAW on startup ── */
+/* ══════════════════════════════════════════════════════
+   SUPABASE CONFIG — replace with your project values
+   Dashboard → Settings → API
+══════════════════════════════════════════════════════ */
+const SB_URL     = 'https://ppytmzkxstglrbyirqal.supabase.co';
+const SB_ANON    = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBweXRtemt4c3RnbHJieWlycWFsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzMDc4MDIsImV4cCI6MjA5NTg4MzgwMn0.pZOFVoo_CZ2N4zntop9cn8ivUSR53h4ZdJVktek8hdM'; // paste your anon/public key here
+
+function sbHeaders(extra={}){
+  return {
+    'apikey': SB_ANON,
+    'Authorization': `Bearer ${SB_ANON}`,
+    'Content-Type': 'application/json',
+    ...extra
+  };
+}
+
 async function loadPersistedEdits(){
   let dbLoaded = false;
   try{
-    const res = await fetch('/.netlify/functions/vessels');
+    const res = await fetch(`${SB_URL}/rest/v1/vessels?select=*&limit=2000`, {
+      headers: sbHeaders()
+    });
     if(!res.ok){ console.warn('DB load failed', res.status); }
     else {
       const rows = await res.json();
@@ -3517,16 +3537,42 @@ function loadLocalEdits(){
 
 async function persistEdit(vessel, principal, field, newVal){
   const pic = document.getElementById('me-sel')?.value || 'Unknown';
+
+  // camelCase JS field → snake_case DB column map
+  const colMap = {
+    lastApproved:   'last_approved',
+    issueType:      'issue_type',
+    biofuelOnboard: 'biofuel_onboard',
+    yearEnd:        'year_end',
+    note:           'note',
+    pic:            'pic',
+    issue:          'issue',
+    biofuel:        'biofuel'
+  };
+  const dbCol = colMap[field] || field;
+
   try{
-    const res = await fetch('/.netlify/functions/vessels', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vessel, principal, field, newVal, by: pic })
-    });
-    if(!res.ok){
-      const err = await res.json().catch(()=>({}));
-      throw new Error(err.error || res.status);
+    // 1) Update the vessel row
+    const patchRes = await fetch(
+      `${SB_URL}/rest/v1/vessels?vessel=eq.${encodeURIComponent(vessel)}&principal=eq.${encodeURIComponent(principal)}`,
+      {
+        method: 'PATCH',
+        headers: sbHeaders({ 'Prefer': 'return=minimal' }),
+        body: JSON.stringify({ [dbCol]: newVal })
+      }
+    );
+    if(!patchRes.ok){
+      const err = await patchRes.json().catch(()=>({}));
+      throw new Error(err.message || patchRes.status);
     }
+
+    // 2) Append audit log row
+    await fetch(`${SB_URL}/rest/v1/audit_log`, {
+      method: 'POST',
+      headers: sbHeaders({ 'Prefer': 'return=minimal' }),
+      body: JSON.stringify({ vessel, principal, field: dbCol, new_val: newVal, by: pic })
+    });
+
     // Success — remove from local fallback if it was saved there
     try {
       let edits = JSON.parse(localStorage.getItem(LS_EDITS_KEY) || '[]');
@@ -3784,7 +3830,9 @@ async function refreshAuditDrawer(){
   const body = document.getElementById('audit-body');
   if(!body) return;
   try{
-    const res = await fetch('/.netlify/functions/audit');
+    const res = await fetch(`${SB_URL}/rest/v1/audit_log?select=*&order=ts.desc&limit=200`, {
+      headers: sbHeaders()
+    });
     if(!res.ok) throw new Error(res.status);
     const log = await res.json();
     if(!log.length){
@@ -3812,7 +3860,10 @@ async function refreshAuditDrawer(){
 async function clearAuditLog(){
   if(!confirm('Clear all edit history? This cannot be undone.')) return;
   try{
-    const res = await fetch('/.netlify/functions/audit', { method: 'DELETE' });
+    const res = await fetch(`${SB_URL}/rest/v1/audit_log?id=gt.0`, {
+      method: 'DELETE',
+      headers: sbHeaders({ 'Prefer': 'return=minimal' })
+    });
     if(!res.ok) throw new Error(res.status);
     refreshAuditDrawer();
   }catch(e){ showToast('⚠ Could not clear audit log: ' + e.message, 'err'); }
@@ -3848,7 +3899,9 @@ async function exportXLSX(){
 
     // Add audit log as a second sheet if there are entries (async fetch from DB)
     try{
-      const res = await fetch('/.netlify/functions/audit');
+      const res = await fetch(`${SB_URL}/rest/v1/audit_log?select=*&order=ts.desc&limit=200`, {
+        headers: sbHeaders()
+      });
       const log = res.ok ? await res.json() : [];
       if(log.length){
         const auditData = log.map(e=>({
